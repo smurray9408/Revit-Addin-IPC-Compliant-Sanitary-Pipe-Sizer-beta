@@ -7,172 +7,222 @@ using System.Linq;
 
 namespace SanitaryPipeSizing
 {
+    /// <summary>
+    /// Sanitary drainage pipe sizing per the 2018 International Plumbing Code.
+    ///
+    ///   Table 704.1     minimum slope of horizontal drainage pipe by size
+    ///   Table 710.1(1)  building drains and sewers (incl. branches of the building drain), by slope
+    ///   Table 710.1(2)  horizontal fixture branches and stacks
+    ///   Section 704.2   no reduction in size in the direction of flow
+    ///
+    /// Values are checked against the 2018 IPC Code and Commentary. A pipe is treated as part of
+    /// the building drain or sewer (Table 710.1(1)) when its Comments parameter contains
+    /// "BUILDING DRAIN", "BD", or "SEWER"; other horizontal pipes are horizontal fixture branches
+    /// (Table 710.1(2), footnote a). The core lookups are pure functions (SizingTables) so they can
+    /// be unit tested without Revit.
+    /// </summary>
     public static class SanitaryPipeSizer
     {
-        /// <summary>
-        /// Sizes all selected sanitary pipes in the active Revit view based on IPC DFU tables.
-        /// </summary>
+        public const double VerticalRatio = 1.0;   // |dz| greater than horizontal run = vertical (stack)
+
         public static int SizeSelectedSanitaryPipes(UIDocument uidoc, Document doc)
         {
-            // Get all selected sanitary pipes, ordered from top to bottom (descending Z)
+            return SizeSelectedSanitaryPipes(uidoc, doc, out _);
+        }
+
+        public static int SizeSelectedSanitaryPipes(UIDocument uidoc, Document doc, out List<string> warnings)
+        {
+            warnings = new List<string>();
             var pipes = uidoc.Selection.GetElementIds()
                 .Select(id => doc.GetElement(id))
                 .OfType<Pipe>()
-                .Where(p => p.PipeSystemType == PipeSystemType.Sanitary)
-                .OrderByDescending(p => GetPipeZElevation(p))
+                .Where(p => p.MEPSystem is PipingSystem ps && ps.SystemType == PipeSystemType.Sanitary)
                 .ToList();
 
-            double maxUpstreamDiameter = 0.0;
+            // Drainage fixture units accumulate in the direction of flow, so sizing pipes in
+            // ascending DFU order sizes every upstream pipe before the pipes it drains into.
+            var dfuOf = pipes.ToDictionary(p => p.Id, p => GetDfu(p));
+            var selected = new HashSet<ElementId>(pipes.Select(p => p.Id));
+            var finalIn = new Dictionary<ElementId, double>();
             int countSized = 0;
 
-            using (Transaction tx = new Transaction(doc, "Size Sanitary Pipes"))
+            using (Transaction tx = new Transaction(doc, "Size Sanitary Pipes (IPC 2018)"))
             {
                 tx.Start();
-
-                foreach (var pipe in pipes)
+                foreach (var pipe in pipes.OrderBy(p => dfuOf[p.Id]))
                 {
-                    // Retrieve DFU value from Revit parameter
-                    double dfu = pipe.get_Parameter(BuiltInParameter.RBS_DRAIN_FIXTURE_UNITS_PARAM)?.AsDouble() ?? 0;
-                    if (dfu < 0.01) continue; // Skip dry or uninitialized pipes
+                    double dfu = dfuOf[pipe.Id];
+                    if (dfu < 0.01) continue;      // dry or unloaded pipe
 
-                    // Get pipe slope (used for horizontal sizing)
-                    double slope = pipe.get_Parameter(BuiltInParameter.RBS_PIPE_SLOPE_PARAM)?.AsDouble() ?? 0.0104;
+                    bool vertical = IsVertical(pipe);
+                    double slope = pipe.get_Parameter(BuiltInParameter.RBS_PIPE_SLOPE_PARAM)?.AsDouble() ?? 0.0;
+                    string note;
+                    double size;
+                    if (vertical)
+                        size = SizingTables.StackDiameter(dfu, out note);
+                    else if (IsBuildingDrain(pipe))
+                        size = SizingTables.BuildingDrainDiameter(dfu, slope, out note);
+                    else
+                        size = SizingTables.HorizontalBranchDiameter(dfu, slope, out note);
 
-                    // Determine if pipe is part of a vertical stack or horizontal drain
-                    bool isVertical = IsPipeVerticalStack(pipe);
-
-                    // 🔹 Step 5: Apply Vertical Pipe Sizing – IPC Table 710.1(1)
-                    // 🔹 Step 6: Apply Horizontal Drain Sizing – IPC Table 710.1(2) + §704.1
-                    double baseDiameter = isVertical
-                        ? GetVerticalStackDiameter(dfu)
-                        : GetHorizontalDrainDiameter(dfu, slope);
-
-                    // 🔹 Step 7: Apply Horizontal Branch Limits – IPC Table 703.2
-                    if (!isVertical)
-                        baseDiameter = ApplyBranchLimits(dfu, baseDiameter);
-
-                    // 🔹 Step 8: Enforce No Reductions in Flow Direction – IPC §710.1.8
-                    double finalDiameterFt = Math.Max(baseDiameter / 12.0, maxUpstreamDiameter);
-
-                    // Set new diameter on pipe (in feet, since Revit internal units are imperial)
-                    var diaParam = pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM);
-                    if (diaParam != null && diaParam.StorageType == StorageType.Double)
+                    // Section 704.2: never smaller than any connected upstream (lower-DFU) pipe.
+                    foreach (var up in ConnectedPipes(pipe))
                     {
-                        diaParam.Set(finalDiameterFt);
+                        if (!selected.Contains(up.Id) || !finalIn.ContainsKey(up.Id)) continue;
+                        if (dfuOf[up.Id] <= dfu && finalIn[up.Id] > size)
+                        {
+                            size = finalIn[up.Id];
+                            note = (note == null ? "" : note + "; ") + "kept at upstream size (IPC 704.2)";
+                        }
+                    }
+                    if (note != null) warnings.Add($"Pipe {pipe.Id}: {note}");
+
+                    var diaParam = pipe.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM);
+                    if (diaParam != null && !diaParam.IsReadOnly && diaParam.StorageType == StorageType.Double)
+                    {
+                        diaParam.Set(size / 12.0);   // Revit internal units are feet
                         countSized++;
                     }
-
-                    maxUpstreamDiameter = Math.Max(maxUpstreamDiameter, finalDiameterFt);
+                    finalIn[pipe.Id] = size;
                 }
-
                 tx.Commit();
             }
-
             return countSized;
         }
 
-        /// <summary>
-        /// Gets the top Z elevation of the pipe in the model.
-        /// Used to size from upstream to downstream (top-down).
-        /// </summary>
-        private static double GetPipeZElevation(Pipe pipe)
+        private static double GetDfu(Pipe p) =>
+            p.get_Parameter(BuiltInParameter.RBS_DRAIN_FIXTURE_UNITS_PARAM)?.AsDouble() ?? 0.0;
+
+        /// <summary>The pipe's own geometry decides stack vs horizontal (not a neighbour's).</summary>
+        private static bool IsVertical(Pipe pipe)
         {
-            var curve = (pipe.Location as LocationCurve)?.Curve;
-            return curve != null ? Math.Max(curve.GetEndPoint(0).Z, curve.GetEndPoint(1).Z) : 0.0;
+            var c = (pipe.Location as LocationCurve)?.Curve;
+            if (c == null) return false;
+            XYZ a = c.GetEndPoint(0), b = c.GetEndPoint(1);
+            double dz = Math.Abs(a.Z - b.Z);
+            double run = Math.Sqrt((a.X - b.X) * (a.X - b.X) + (a.Y - b.Y) * (a.Y - b.Y));
+            return dz > VerticalRatio * run;
         }
 
-        /// <summary>
-        /// Detects whether the pipe is a vertical stack based on geometric orientation.
-        /// Vertical stack is defined as having more Z-axis than X/Y delta between endpoints.
-        /// </summary>
-        private static bool IsPipeVerticalStack(Pipe pipe)
+        private static bool IsBuildingDrain(Pipe pipe)
         {
-            ConnectorManager cm = pipe.ConnectorManager;
-            foreach (Connector conn in cm.Connectors)
+            string s = (pipe.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)?.AsString() ?? "").ToUpperInvariant();
+            return s.Contains("BUILDING DRAIN") || s.Contains("SEWER") ||
+                   s.Split(new[] { ' ', ',', ';', '-' }, StringSplitOptions.RemoveEmptyEntries).Contains("BD");
+        }
+
+        /// <summary>Pipes joined to this pipe directly or through one fitting.</summary>
+        private static IEnumerable<Pipe> ConnectedPipes(Pipe pipe)
+        {
+            var seen = new HashSet<ElementId> { pipe.Id };
+            foreach (Connector c in pipe.ConnectorManager.Connectors)
             {
-                foreach (Connector refConn in conn.AllRefs)
+                foreach (Connector r in c.AllRefs)
                 {
-                    if (refConn.Owner is Pipe other && other.Id != pipe.Id)
+                    if (r.Owner is Pipe p && seen.Add(p.Id)) { yield return p; continue; }
+                    if (r.Owner is FamilyInstance fi && fi.MEPModel?.ConnectorManager != null)
                     {
-                        XYZ p0 = other.get_EndPoint(0);
-                        XYZ p1 = other.get_EndPoint(1);
-                        double dz = Math.Abs(p0.Z - p1.Z);
-                        double dx = Math.Abs(p0.X - p1.X);
-                        double dy = Math.Abs(p0.Y - p1.Y);
-                        if (dz > dx && dz > dy) return true;
+                        foreach (Connector fc in fi.MEPModel.ConnectorManager.Connectors)
+                            foreach (Connector fr in fc.AllRefs)
+                                if (fr.Owner is Pipe q && seen.Add(q.Id)) yield return q;
                     }
                 }
             }
-            return false;
         }
+    }
 
-        /// <summary>
-        /// IPC Table 710.1(1) — Maximum DFU for Vertical Stacks
-        /// Maps DFU to required pipe diameter (inches).
-        /// </summary>
-        private static double GetVerticalStackDiameter(double dfu)
+    /// <summary>2018 IPC tables. Sizes in inches, slopes in ft/ft (1/4 in./ft = 0.020833).</summary>
+    public static class SizingTables
+    {
+        public static readonly double[] Sizes = { 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15 };
+
+        /// <summary>Table 704.1: 2-1/2 in. or less 1/4 in./ft; 3 to 6 in. 1/8 in./ft; 8 in. or larger 1/16 in./ft.</summary>
+        public static double MinSlope(double size) =>
+            size <= 2.5 ? 0.25 / 12 : size <= 6 ? 0.125 / 12 : 0.0625 / 12;
+
+        // Table 710.1(1) building drains and sewers: size -> max DFU at 1/16, 1/8, 1/4, 1/2 in./ft (0 = not permitted)
+        private static readonly Dictionary<double, int[]> BuildingDrain = new Dictionary<double, int[]>
         {
-            var table = new SortedDictionary<double, double>
-            {
-                { 2, 1.5 }, { 4, 2 }, { 6, 2.5 }, { 12, 3 }, { 42, 4 },
-                { 72, 5 }, { 120, 6 }, { 250, 8 }, { 500, 10 }, { 840, 12 }
-            };
+            { 1.25, new[] { 0, 0, 1, 1 } },        { 1.5, new[] { 0, 0, 3, 3 } },
+            { 2,    new[] { 0, 0, 21, 26 } },      { 2.5, new[] { 0, 0, 24, 31 } },
+            { 3,    new[] { 0, 36, 42, 50 } },     { 4,   new[] { 0, 180, 216, 250 } },
+            { 5,    new[] { 0, 390, 480, 575 } },  { 6,   new[] { 0, 700, 840, 1000 } },
+            { 8,    new[] { 1400, 1600, 1920, 2300 } },  { 10, new[] { 2500, 2900, 3500, 4200 } },
+            { 12,   new[] { 3900, 4600, 5600, 6700 } },  { 15, new[] { 7000, 8300, 10000, 12000 } },
+        };
+        private static readonly double[] SlopeCols = { 0.0625 / 12, 0.125 / 12, 0.25 / 12, 0.5 / 12 };
 
-            // Return the first diameter where DFU fits under max limit
-            return table.FirstOrDefault(kvp => dfu <= kvp.Key).Value != 0
-                ? table.First(kvp => dfu <= kvp.Key).Value
-                : 15; // Default to 15" if above chart range
-        }
-
-        /// <summary>
-        /// IPC Table 710.1(2) — Maximum DFU for Horizontal Drains
-        /// IPC §704.1 — Minimum Slope by Pipe Diameter
-        /// </summary>
-        private static double GetHorizontalDrainDiameter(double dfu, double slope)
+        // Table 710.1(2): size -> (horizontal branch, one branch interval, stack <= 3 intervals, stack > 3 intervals)
+        private static readonly Dictionary<double, int[]> BranchStack = new Dictionary<double, int[]>
         {
-            // IPC §704.1 states that slope must meet minimum thresholds.
-            // If below 1/8" per foot (0.0104 ft/ft), we conservatively default to 4".
-            if (slope < 0.0104) return 4;
+            { 1.5, new[] { 3, 2, 4, 8 } },          { 2, new[] { 6, 6, 10, 24 } },
+            { 2.5, new[] { 12, 9, 20, 42 } },       { 3, new[] { 20, 20, 48, 72 } },
+            { 4,   new[] { 160, 90, 240, 500 } },   { 5, new[] { 360, 200, 540, 1100 } },
+            { 6,   new[] { 620, 350, 960, 1900 } }, { 8, new[] { 1400, 600, 2200, 3600 } },
+            { 10,  new[] { 2500, 1000, 3800, 5600 } }, { 12, new[] { 3900, 1500, 6000, 8400 } },
+        };
 
-            var table = new SortedDictionary<double, double>
-            {
-                { 3, 1.5 }, { 6, 2 }, { 9, 2.5 }, { 12, 3 }, { 26, 4 },
-                { 50, 5 }, { 75, 6 }, { 150, 8 }, { 216, 10 }, { 300, 12 }, { 575, 15 }
-            };
+        private const double Tol = 1e-4;   // slope tolerance for model rounding
 
-            return table.FirstOrDefault(kvp => dfu <= kvp.Key).Value != 0
-                ? table.First(kvp => dfu <= kvp.Key).Value
-                : 4; // Default to 4" if out of range
-        }
-
-        /// <summary>
-        /// IPC Table 703.2 — Maximum DFU on Horizontal Branches
-        /// Applies upper limit by DFU and pipe diameter to enforce code-legal combinations.
-        /// </summary>
-        private static double ApplyBranchLimits(double dfu, double currentSize)
+        /// <summary>Table 710.1(1) + Table 704.1. Uses the steepest table column not steeper than the drawn slope (no interpolation).</summary>
+        public static double BuildingDrainDiameter(double dfu, double slope, out string note)
         {
-            var limits = new SortedDictionary<double, double>
+            note = null;
+            int col = -1;
+            for (int i = 0; i < SlopeCols.Length; i++)
+                if (slope + Tol >= SlopeCols[i]) col = i;
+            bool tooFlat = col < 0;
+            if (tooFlat)
             {
-                { 1.5, 3 }, { 2.0, 6 }, { 2.5, 9 }, { 3.0, 20 }, { 4.0, 160 },
-                { 5.0, 360 }, { 6.0, 620 }, { 8.0, 1400 }, { 10.0, 2500 }
-            };
-
-            // Find smallest legal pipe size ≥ current size that can support the DFU
-            foreach (var kvp in limits)
-            {
-                if (dfu <= kvp.Value && kvp.Key >= currentSize)
-                    return kvp.Key;
+                note = $"slope {slope * 12:0.###} in./ft is below 1/16 in./ft (Table 704.1); sized at 1/16 in./ft, fix the slope";
+                col = 0;
             }
+            foreach (var kv in BuildingDrain)
+            {
+                if (!tooFlat && slope + Tol < MinSlope(kv.Key)) continue;   // too flat for this size (704.1)
+                if (kv.Value[col] > 0 && dfu <= kv.Value[col]) return kv.Key;
+            }
+            note = $"{dfu} DFU exceeds Table 710.1(1); engineered design required";
+            return 15;
+        }
 
-            return currentSize; // No change if no limit violated
+        /// <summary>Table 710.1(2) horizontal fixture branch, with the Table 704.1 slope minimum.</summary>
+        public static double HorizontalBranchDiameter(double dfu, double slope, out string note)
+        {
+            note = null;
+            foreach (var kv in BranchStack)
+            {
+                if (dfu > kv.Value[0]) continue;
+                if (slope > 0 && slope + Tol < MinSlope(kv.Key))
+                {
+                    note = $"slope {slope * 12:0.###} in./ft is below the Table 704.1 minimum for {kv.Key} in.";
+                    continue;   // a larger pipe has a lower minimum slope
+                }
+                return kv.Key;
+            }
+            note = $"{dfu} DFU exceeds Table 710.1(2) horizontal branch; engineered design required";
+            return 15;
         }
 
         /// <summary>
-        /// Extension method to get a pipe endpoint, with null safety.
+        /// Table 710.1(2) stack, conservative "three branch intervals or less" column. Footnote b:
+        /// stacks are sized on the accumulated load and may reduce upward, but not below half the
+        /// largest required stack size; that check needs the whole stack and is reported, not enforced.
         /// </summary>
-        public static XYZ get_EndPoint(this Pipe pipe, int index)
+        public static double StackDiameter(double dfu, out string note)
         {
-            return (pipe.Location as LocationCurve)?.Curve.GetEndPoint(index) ?? XYZ.Zero;
+            note = null;
+            foreach (var kv in BranchStack)
+                if (dfu <= kv.Value[2]) return kv.Key;
+            note = $"{dfu} DFU exceeds Table 710.1(2) stack (three intervals or less); engineered design required";
+            return 15;
         }
+    }
+
+    /// <summary>Revit-free extension kept for callers of the original API.</summary>
+    public static class PipeExtensions
+    {
+        public static XYZ get_EndPoint(this Pipe pipe, int index) =>
+            (pipe.Location as LocationCurve)?.Curve.GetEndPoint(index) ?? XYZ.Zero;
     }
 }

@@ -22,6 +22,27 @@ When a user selects sanitary pipes in a Revit model and runs the command:
 
 ⸻
 
+Murray Plumbing fork: 2018 IPC corrections
+
+Checked line by line against the 2018 IPC Code and Commentary. Changes from the upstream beta:
+
+| Item | Upstream | Corrected |
+|---|---|---|
+| Building drains and sewers | Labelled 710.1(2); one column, no slope | Table 710.1(1) by slope column (1/16, 1/8, 1/4, 1/2 in./ft), no interpolation; used when the pipe Comments contain BUILDING DRAIN, BD or SEWER |
+| Horizontal fixture branches | "Table 703.2" (703.2 is drainage pipe in filled ground) | Table 710.1(2) horizontal branch column (1-1/2 in. 3, 2 in. 6, 2-1/2 in. 12, 3 in. 20, 4 in. 160 DFU) |
+| Stacks | Labelled 710.1(1); values did not match any column | Table 710.1(2), conservative three-branch-intervals-or-less column (2 in. 10, 3 in. 48, 4 in. 240) |
+| Slope | Below 1/8 in./ft forced 4 in. | Table 704.1 minimum by size (2-1/2 in. or less 1/4, 3 to 6 in. 1/8, 8 in. and up 1/16); a pipe too flat for a size steps up to the size whose minimum it meets |
+| No reduction | "710.1.8"; one running maximum across every selected pipe by elevation, so every lower pipe took the largest size in the selection | Section 704.2 along the flow path: a pipe is never smaller than a connected upstream (lower DFU) pipe |
+| Stack vs horizontal | Tested the neighbouring pipe's geometry | Tests the pipe's own geometry |
+| System filter | `Pipe.PipeSystemType` | `PipingSystem.SystemType == Sanitary` |
+| Review output | Count only | Count plus per-pipe notes (too flat, over table, kept at upstream size) |
+
+Not covered (check by hand): the water closet 3 in. minimum on the building drain (Table 710.1(1) footnote a; Revit DFU does not say which fixtures are WCs), stack reduction limits (710.1(2) footnote b), one-branch-interval loads, vents.
+
+Tests: `dotnet run --project tests/SizingTests.csproj` builds the add-in against compile-only Revit stubs and checks 21 table cases. It does not exercise Revit itself; test in a model before production use.
+
+⸻
+
 📘 Code Compliance Overview
 
 The tool implements logic directly aligned with IPC:
